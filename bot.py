@@ -542,11 +542,22 @@ async def buy_qty(m: Message, state: FSMContext):
         rows.append([InlineKeyboardButton(text=f"💳 Оплатить {total} ₽", url=pay_url)])
     rows.append([InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"paid:{order_id}")])
     rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="menu")])
-    await m.answer(
-        fmt("pay_text", order_id=order_id, niche=data["niche"], city=data["city"],
-            qty=qty, total=total),
-        reply_markup=kb(rows),
-    )
+    text = fmt("pay_text", order_id=order_id, niche=data["niche"], city=data["city"],
+               qty=qty, total=total)
+    try:
+        await m.answer(text, reply_markup=kb(rows))
+    except Exception as e:
+        # Чаще всего — Telegram не принял ссылку на оплату. Отправляем без неё и сообщаем админу.
+        logging.error("Не удалось отправить сообщение об оплате: %s", e)
+        await m.answer(text + f"\n\nСсылка на оплату: {pay_url}", reply_markup=kb(rows[-2:]))
+        for admin_id in ADMIN_IDS:
+            try:
+                await m.bot.send_message(
+                    admin_id,
+                    f"⚠️ Telegram не принял ссылку на оплату:\n{pay_url}\n\nОшибка: {e}\n\n"
+                    "Проверьте ссылку в /admin → «Ссылка на оплату».")
+            except Exception:
+                pass
 
 
 @router.callback_query(F.data.startswith("paid:"))
@@ -851,7 +862,7 @@ async def edit_value(m: Message, state: FSMContext):
     if kind == "int" and (not value.isdigit() or int(value) < 1):
         await m.answer("Нужно целое число больше нуля. Попробуйте ещё раз или /cancel")
         return
-    if kind == "url" and not value.startswith(("http://", "https://")):
+    if kind == "url" and (not value.startswith(("http://", "https://")) or " " in value):
         await m.answer("Ссылка должна начинаться с https://. Попробуйте ещё раз или /cancel")
         return
     if key.startswith("btn_") and len(value) > 60:
