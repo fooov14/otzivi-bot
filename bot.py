@@ -15,7 +15,8 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.base import BaseStorage, StorageKey
+import json
 from aiogram.types import (
     BotCommand,
     CallbackQuery,
@@ -169,6 +170,45 @@ def init_db():
                 logging.warning("В таблицу orders добавлена колонка %s", col)
         for key, (_, default, _) in SETTINGS.items():
             c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, default))
+
+
+class SQLiteStorage(BaseStorage):
+    """Хранит шаг диалога в bot.db, чтобы он не терялся при перезапуске бота."""
+
+    def __init__(self):
+        with db() as c:
+            c.execute("CREATE TABLE IF NOT EXISTS fsm (k TEXT PRIMARY KEY, state TEXT, data TEXT)")
+
+    @staticmethod
+    def _k(key: StorageKey) -> str:
+        return f"{key.bot_id}:{key.chat_id}:{key.user_id}:{key.thread_id}:{key.destiny}"
+
+    def _row(self, key):
+        with db() as c:
+            return c.execute("SELECT state, data FROM fsm WHERE k = ?", (self._k(key),)).fetchone()
+
+    async def set_state(self, key: StorageKey, state=None) -> None:
+        value = state.state if isinstance(state, State) else state
+        with db() as c:
+            c.execute("INSERT INTO fsm (k, state, data) VALUES (?, ?, '{}') "
+                      "ON CONFLICT(k) DO UPDATE SET state = excluded.state", (self._k(key), value))
+
+    async def get_state(self, key: StorageKey):
+        row = self._row(key)
+        return row["state"] if row else None
+
+    async def set_data(self, key: StorageKey, data) -> None:
+        payload = json.dumps(dict(data), ensure_ascii=False)
+        with db() as c:
+            c.execute("INSERT INTO fsm (k, state, data) VALUES (?, NULL, ?) "
+                      "ON CONFLICT(k) DO UPDATE SET data = excluded.data", (self._k(key), payload))
+
+    async def get_data(self, key: StorageKey) -> dict:
+        row = self._row(key)
+        return json.loads(row["data"] or "{}") if row else {}
+
+    async def close(self) -> None:
+        pass
 
 
 def get(key: str) -> str:
@@ -967,6 +1007,14 @@ async def cb_done(c: CallbackQuery, bot: Bot):
     await c.answer("Готово")
 
 
+@router.message(StateFilter(None))
+async def fallback(m: Message):
+    """Сообщение вне диалога — раньше бот молчал, теперь подсказывает."""
+    await m.answer("Не понял сообщение. Выберите раздел в меню ниже 👇\n"
+                   "Если вы оформляли заказ — нажмите «Купить» и начните заново.",
+                   reply_markup=reply_menu())
+
+
 # ----------------------------------------------------------------------------
 # Запуск
 # ----------------------------------------------------------------------------
@@ -980,7 +1028,7 @@ async def main():
         logging.warning("ADMIN_IDS не указан в config.env — админка никому не доступна")
     init_db()
     bot = Bot(BOT_TOKEN)
-    dp = Dispatcher(storage=MemoryStorage())
+    dp = Dispatcher(storage=SQLiteStorage())
     dp.include_router(router)
     await bot.set_my_commands([BotCommand(command="start", description="Главное меню")])
     await dp.start_polling(bot)
