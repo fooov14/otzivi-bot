@@ -46,6 +46,13 @@ SETTINGS = {
     "btn_prices": ("Кнопка «Цены»", "💰 Цены и оплата", "text"),
     "btn_buy": ("Кнопка «Купить»", "🛒 Купить клиентов", "text"),
     "btn_contact": ("Кнопка «Связаться»", "📞 Связаться", "text"),
+    "btn_orders": ("Кнопка «Мои заказы»", "📦 Мои заказы", "text"),
+    "btn_reviews": ("Кнопка «Отзывы»", "⭐ Отзывы", "text"),
+    "reviews_empty": ("Текст: отзывов нет", "Отзывов пока нет. Станьте первым!", "text"),
+    "review_ask_stars": ("Вопрос: оценка", "Оцените нашу работу от 1 до 5:", "text"),
+    "review_ask_text": ("Вопрос: комментарий", "Напишите пару слов о работе с нами:", "text"),
+    "review_thanks": ("Текст: спасибо за отзыв", "Спасибо за отзыв! 🙏", "text"),
+    "no_orders": ("Текст: заказов нет", "У вас пока нет заказов. Нажмите «🛒 Купить клиентов», чтобы оформить первый.", "text"),
     "welcome": (
         "Приветствие (/start)",
         "Привет! 👋\n\n"
@@ -94,6 +101,11 @@ SETTINGS = {
         "✅ Оплата по заявке №{order_id} подтверждена. Начинаем работу!",
         "text",
     ),
+    "done_text": (
+        "Текст: заказ выполнен",
+        "🏁 Заказ №{order_id} выполнен! Спасибо, что выбрали нас.",
+        "text",
+    ),
     "rejected_text": (
         "Текст: оплата не найдена",
         "❌ Мы не нашли оплату по заявке №{order_id}. Напишите нам, разберёмся.",
@@ -101,11 +113,22 @@ SETTINGS = {
     ),
 }
 
+# Статусы для админа
 STATUS_NAMES = {
     "new": "🆕 создана, не оплачена",
     "check": "⏳ ждёт проверки оплаты",
-    "paid": "✅ оплачена",
+    "paid": "🔄 оплачена, в процессе",
+    "done": "🏁 выполнена",
     "rejected": "❌ отклонена",
+}
+
+# Статусы, которые видит клиент в «Мои заказы»
+CLIENT_STATUS = {
+    "new": "🕓 Ожидает оплаты",
+    "check": "⏳ Оплата на проверке",
+    "paid": "🔄 Оплата принята — в процессе",
+    "done": "🏁 Выполнен",
+    "rejected": "❌ Оплата не найдена",
 }
 
 # ----------------------------------------------------------------------------
@@ -130,6 +153,10 @@ def init_db():
             "CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY AUTOINCREMENT, "
             "user_id INTEGER, username TEXT, niche TEXT, city TEXT, qty INTEGER, "
             "total INTEGER, status TEXT, created TEXT)"
+        )
+        c.execute(
+            "CREATE TABLE IF NOT EXISTS reviews (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "user_id INTEGER UNIQUE, username TEXT, name TEXT, stars INTEGER, text TEXT, created TEXT)"
         )
         for key, (_, default, _) in SETTINGS.items():
             c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, default))
@@ -212,20 +239,22 @@ def main_menu():
         [InlineKeyboardButton(text=get("btn_info"), callback_data="info")],
         [InlineKeyboardButton(text=get("btn_prices"), callback_data="prices")],
         [InlineKeyboardButton(text=get("btn_buy"), callback_data="buy")],
+        [InlineKeyboardButton(text=get("btn_orders"), callback_data="orders")],
+        [InlineKeyboardButton(text=get("btn_reviews"), callback_data="rev:0")],
         [InlineKeyboardButton(text=get("btn_contact"), callback_data="contact")],
     ])
 
 
-MENU_KEYS = ("btn_info", "btn_prices", "btn_buy", "btn_contact")
+MENU_KEYS = ("btn_info", "btn_prices", "btn_buy", "btn_orders", "btn_reviews", "btn_contact")
 
 
 def reply_menu():
     """Постоянные кнопки меню внизу экрана (всегда видны)."""
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=get("btn_buy"))],
+            [KeyboardButton(text=get("btn_buy")), KeyboardButton(text=get("btn_orders"))],
             [KeyboardButton(text=get("btn_info")), KeyboardButton(text=get("btn_prices"))],
-            [KeyboardButton(text=get("btn_contact"))],
+            [KeyboardButton(text=get("btn_reviews")), KeyboardButton(text=get("btn_contact"))],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -247,6 +276,7 @@ def admin_menu():
     return kb([
         [InlineKeyboardButton(text="✏️ Тексты, кнопки, цена, оплата", callback_data="adm:settings")],
         [InlineKeyboardButton(text="📋 Заявки", callback_data="adm:orders")],
+        [InlineKeyboardButton(text="⭐ Отзывы", callback_data="adm:reviews")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="adm:stats")],
     ])
 
@@ -271,6 +301,10 @@ class Buy(StatesGroup):
     niche = State()
     city = State()
     qty = State()
+
+
+class Review(StatesGroup):
+    text = State()
 
 
 class Edit(StatesGroup):
@@ -302,6 +336,24 @@ async def ask_niche(m: Message, state: FSMContext):
     await m.answer(fmt("ask_niche") + "\n\n(для отмены — /cancel)")
 
 
+def my_orders_text(user_id: int) -> str:
+    with db() as conn:
+        orders = conn.execute(
+            "SELECT * FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 10", (user_id,)
+        ).fetchall()
+    if not orders:
+        return fmt("no_orders")
+    lines = []
+    for o in orders:
+        lines.append(
+            f"Заказ №{o['id']} от {o['created']}\n"
+            f"{o['niche']}, {o['city']} — {o['qty']} шт.\n"
+            f"Сумма: {o['total']} ₽\n"
+            f"Статус: {CLIENT_STATUS.get(o['status'], o['status'])}"
+        )
+    return "📦 Ваши заказы:\n\n" + "\n\n".join(lines)
+
+
 @router.message(lambda m: m.text is not None and menu_key(m.text) is not None)
 async def reply_menu_press(m: Message, state: FSMContext):
     """Нажатие на постоянную кнопку меню внизу — работает в любой момент."""
@@ -310,6 +362,11 @@ async def reply_menu_press(m: Message, state: FSMContext):
     key = menu_key(m.text)
     if key == "btn_buy":
         await ask_niche(m, state)
+    elif key == "btn_orders":
+        await m.answer(my_orders_text(m.from_user.id), reply_markup=reply_menu())
+    elif key == "btn_reviews":
+        text, markup = reviews_page(0)
+        await m.answer(text, reply_markup=markup)
     else:
         page = {"btn_info": "info", "btn_prices": "prices", "btn_contact": "contact"}[key]
         await m.answer(fmt(page), reply_markup=reply_menu())
@@ -325,6 +382,124 @@ async def cb_menu(c: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.in_({"info", "prices", "contact"}))
 async def cb_page(c: CallbackQuery):
     await c.message.answer(fmt(c.data), reply_markup=back_menu())
+    await c.answer()
+
+
+# ---------------- Отзывы ----------------
+
+REVIEWS_PAGE = 5
+
+
+def stars_str(n: int) -> str:
+    return "⭐" * n + "☆" * (5 - n)
+
+
+def can_review(user_id: int) -> bool:
+    """True, если у пользователя есть выполненный заказ (для отметки «✅ клиент»)."""
+    with db() as conn:
+        return conn.execute(
+            "SELECT 1 FROM orders WHERE user_id = ? AND status = 'done' LIMIT 1", (user_id,)
+        ).fetchone() is not None
+
+
+def reviews_page(page: int):
+    with db() as conn:
+        total, avg = conn.execute("SELECT COUNT(*), AVG(stars) FROM reviews").fetchone()
+        rows_db = conn.execute(
+            "SELECT * FROM reviews ORDER BY id DESC LIMIT ? OFFSET ?",
+            (REVIEWS_PAGE, page * REVIEWS_PAGE),
+        ).fetchall()
+    rows = [[InlineKeyboardButton(text="✍️ Написать отзыв", callback_data="rev_write")]]
+    if not total:
+        return fmt("reviews_empty"), kb(rows + [[InlineKeyboardButton(text="⬅️ В меню", callback_data="menu")]])
+    parts = [f"⭐ Рейтинг: {avg:.1f} из 5 · отзывов: {total}"]
+    for r in rows_db:
+        who = f"@{r['username']}" if r["username"] else r["name"]
+        badge = " · ✅ клиент" if can_review(r["user_id"]) else ""
+        block = f"{stars_str(r['stars'])}  {who}{badge} · {r['created'][:10]}"
+        if r["text"]:
+            block += f"\n{r['text']}"
+        parts.append(block)
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"rev:{page - 1}"))
+    if (page + 1) * REVIEWS_PAGE < total:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"rev:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="menu")])
+    return "\n\n".join(parts), kb(rows)
+
+
+@router.callback_query(F.data.startswith("rev:"))
+async def cb_reviews(c: CallbackQuery):
+    text, markup = reviews_page(int(c.data.split(":")[1]))
+    if c.data == "rev:0" and not c.message.text.startswith("⭐ Рейтинг"):
+        await c.message.answer(text, reply_markup=markup)
+    else:
+        await c.message.edit_text(text, reply_markup=markup)
+    await c.answer()
+
+
+@router.callback_query(F.data == "rev_write")
+async def cb_rev_write(c: CallbackQuery):
+    stars = [[InlineKeyboardButton(text=stars_str(n), callback_data=f"rate:{n}")] for n in range(5, 0, -1)]
+    await c.message.answer(fmt("review_ask_stars"), reply_markup=kb(stars))
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("rate:"))
+async def cb_rate(c: CallbackQuery, state: FSMContext):
+    n = int(c.data.split(":")[1])
+    await state.set_state(Review.text)
+    await state.update_data(stars=n)
+    await c.message.edit_text(f"Ваша оценка: {stars_str(n)}")
+    await c.message.answer(
+        fmt("review_ask_text"),
+        reply_markup=kb([[InlineKeyboardButton(text="Без комментария", callback_data="rev_skip")]]),
+    )
+    await c.answer()
+
+
+async def save_review(user, stars: int, text: str, bot: Bot):
+    with db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO reviews (user_id, username, name, stars, text, created) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (user.id, user.username or "", user.full_name, stars, text,
+             datetime.now().strftime("%Y-%m-%d %H:%M")),
+        )
+    who = f"@{user.username}" if user.username else user.full_name
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, f"⭐ Новый отзыв от {who}\n{stars_str(stars)}\n{text}")
+        except Exception:
+            pass
+
+
+@router.message(Review.text, F.text)
+async def review_text(m: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    await state.clear()
+    await save_review(m.from_user, data["stars"], m.text.strip()[:1000], bot)
+    await m.answer(fmt("review_thanks"), reply_markup=reply_menu())
+
+
+@router.callback_query(F.data == "rev_skip")
+async def cb_rev_skip(c: CallbackQuery, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    if "stars" not in data:
+        await c.answer()
+        return
+    await state.clear()
+    await save_review(c.from_user, data["stars"], "", bot)
+    await c.message.edit_text(fmt("review_thanks"))
+    await c.answer()
+
+
+@router.callback_query(F.data == "orders")
+async def cb_orders(c: CallbackQuery):
+    await c.message.answer(my_orders_text(c.from_user.id), reply_markup=back_menu())
     await c.answer()
 
 
@@ -415,6 +590,118 @@ async def buy_wrong(m: Message):
 # ----------------------------------------------------------------------------
 
 
+# ---------------- Заявки в админке ----------------
+
+FILTERS = [
+    ("check", "⏳ Ждут проверки оплаты"),
+    ("paid", "🔄 В процессе"),
+    ("new", "🆕 Не оплачены"),
+    ("done", "🏁 Выполнены"),
+    ("rejected", "❌ Отклонены"),
+    ("all", "📋 Все заявки"),
+]
+PAGE_SIZE = 8
+
+
+def count_orders(status: str) -> int:
+    with db() as conn:
+        if status == "all":
+            return conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+        return conn.execute("SELECT COUNT(*) FROM orders WHERE status = ?", (status,)).fetchone()[0]
+
+
+def orders_filters():
+    rows = [[InlineKeyboardButton(text=f"{name} ({count_orders(st)})", callback_data=f"list:{st}:0")]
+            for st, name in FILTERS]
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:home")])
+    return "📋 Заявки — выберите раздел:", kb(rows)
+
+
+def orders_list(status: str, page: int):
+    with db() as conn:
+        if status == "all":
+            orders = conn.execute("SELECT * FROM orders ORDER BY id DESC LIMIT ? OFFSET ?",
+                                  (PAGE_SIZE, page * PAGE_SIZE)).fetchall()
+        else:
+            orders = conn.execute(
+                "SELECT * FROM orders WHERE status = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+                (status, PAGE_SIZE, page * PAGE_SIZE)).fetchall()
+    total = count_orders(status)
+    title = dict(FILTERS)[status]
+    if not orders:
+        text = f"{title}\n\nЗдесь пока пусто."
+    else:
+        pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+        text = f"{title} — {total} шт. (стр. {page + 1}/{pages})\n\nНажмите на заявку, чтобы открыть её."
+    rows = []
+    for o in orders:
+        icon = STATUS_NAMES.get(o["status"], "").split(" ")[0]
+        rows.append([InlineKeyboardButton(
+            text=f"{icon} №{o['id']} · {o['niche'][:18]} · {o['total']} ₽",
+            callback_data=f"ord:{o['id']}:{status}:{page}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"list:{status}:{page - 1}"))
+    if (page + 1) * PAGE_SIZE < total:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"list:{status}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="⬅️ К разделам", callback_data="adm:orders_edit")])
+    return text, kb(rows)
+
+
+def order_card(order_id: int, back: str = "all:0"):
+    o = get_order(order_id)
+    if not o:
+        return "Заявка не найдена.", kb([[InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:orders_edit")]])
+    who = f"@{o['username']}" if o["username"] else f"id {o['user_id']}"
+    text = (
+        f"📄 Заявка №{o['id']}\n\n"
+        f"Создана: {o['created']}\n"
+        f"Клиент: {who}\n"
+        f"Ниша: {o['niche']}\n"
+        f"Город: {o['city']}\n"
+        f"Количество: {o['qty']} шт.\n"
+        f"Сумма: {o['total']} ₽\n\n"
+        f"Статус: {STATUS_NAMES.get(o['status'], o['status'])}"
+    )
+    rows = []
+    st = o["status"]
+    if st in ("check", "new", "rejected"):
+        rows.append([InlineKeyboardButton(text="✅ Оплата принята", callback_data=f"ok:{o['id']}:c")])
+    if st in ("check", "new"):
+        rows.append([InlineKeyboardButton(text="❌ Отклонить", callback_data=f"no:{o['id']}:c")])
+    if st == "paid":
+        rows.append([InlineKeyboardButton(text="🏁 Заказ выполнен", callback_data=f"done:{o['id']}:c")])
+    if o["username"]:
+        rows.append([InlineKeyboardButton(text="💬 Написать клиенту", url=f"https://t.me/{o['username']}")])
+    st_back, page_back = back.split(":")
+    rows.append([InlineKeyboardButton(text="⬅️ К списку", callback_data=f"list:{st_back}:{page_back}")])
+    return text, kb(rows)
+
+
+@router.callback_query(F.data.startswith("list:"))
+async def cb_list(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        await c.answer()
+        return
+    _, status, page = c.data.split(":")
+    text, markup = orders_list(status, int(page))
+    await c.message.edit_text(text, reply_markup=markup)
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("ord:"))
+async def cb_order(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        await c.answer()
+        return
+    _, order_id, status, page = c.data.split(":")
+    text, markup = order_card(int(order_id), f"{status}:{page}")
+    await c.message.edit_text(text, reply_markup=markup)
+    await c.answer()
+
+
 @router.message(Command("admin"))
 async def admin(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id):
@@ -431,6 +718,12 @@ async def cb_admin(c: CallbackQuery, state: FSMContext):
     await state.clear()
     action = c.data.split(":")[1]
 
+    if action == "orders_edit":
+        text, markup = orders_filters()
+        await c.message.edit_text(text, reply_markup=markup)
+        await c.answer()
+        return
+
     if action == "home":
         await c.message.answer("⚙️ Админ-панель", reply_markup=admin_menu())
 
@@ -438,28 +731,18 @@ async def cb_admin(c: CallbackQuery, state: FSMContext):
         await c.message.answer("Что изменить?", reply_markup=settings_menu())
 
     elif action == "orders":
-        with db() as conn:
-            orders = conn.execute("SELECT * FROM orders ORDER BY id DESC LIMIT 15").fetchall()
-        if not orders:
-            await c.message.answer("Заявок пока нет.", reply_markup=admin_menu())
-        else:
-            lines = []
-            for o in orders:
-                who = f"@{o['username']}" if o["username"] else f"id {o['user_id']}"
-                lines.append(
-                    f"№{o['id']} · {o['created']} · {who}\n"
-                    f"{o['niche']}, {o['city']}, {o['qty']} шт., {o['total']} ₽\n"
-                    f"{STATUS_NAMES.get(o['status'], o['status'])}"
-                )
-            await c.message.answer("Последние заявки:\n\n" + "\n\n".join(lines),
-                                   reply_markup=admin_menu())
+        await c.message.answer(*orders_filters())
+
+    elif action == "reviews":
+        text, markup = admin_reviews(0)
+        await c.message.answer(text, reply_markup=markup)
 
     elif action == "stats":
         with db() as conn:
             users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
             orders = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
             paid = conn.execute(
-                "SELECT COUNT(*), COALESCE(SUM(total), 0) FROM orders WHERE status = 'paid'"
+                "SELECT COUNT(*), COALESCE(SUM(total), 0) FROM orders WHERE status IN ('paid', 'done')"
             ).fetchone()
         await c.message.answer(
             f"📊 Статистика\n\nПользователей: {users}\nЗаявок всего: {orders}\n"
@@ -467,6 +750,67 @@ async def cb_admin(c: CallbackQuery, state: FSMContext):
             reply_markup=admin_menu(),
         )
     await c.answer()
+
+
+ADMIN_REV_PAGE = 5
+
+
+def admin_reviews(page: int):
+    with db() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM reviews").fetchone()[0]
+        revs = conn.execute("SELECT * FROM reviews ORDER BY id DESC LIMIT ? OFFSET ?",
+                            (ADMIN_REV_PAGE, page * ADMIN_REV_PAGE)).fetchall()
+    if not total:
+        return "Отзывов пока нет.", admin_menu()
+    if not revs and page > 0:
+        return admin_reviews(page - 1)
+    lines, rows = [], []
+    for r in revs:
+        who = f"@{r['username']}" if r["username"] else r["name"]
+        lines.append(f"№{r['id']} {stars_str(r['stars'])} {who} · {r['created'][:10]}\n{r['text'] or '—'}")
+        rows.append([InlineKeyboardButton(text=f"🗑 Удалить №{r['id']}",
+                                          callback_data=f"rdel:{r['id']}:{page}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"arev:{page - 1}"))
+    if (page + 1) * ADMIN_REV_PAGE < total:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"arev:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:home")])
+    return f"⭐ Отзывы — всего {total}\n\n" + "\n\n".join(lines), kb(rows)
+
+
+@router.callback_query(F.data.startswith("arev:"))
+async def cb_arev(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        await c.answer()
+        return
+    text, markup = admin_reviews(int(c.data.split(":")[1]))
+    await c.message.edit_text(text, reply_markup=markup)
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("rdel:"))
+async def cb_rdel(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        await c.answer()
+        return
+    parts = c.data.split(":")
+    rid = int(parts[1])
+    page = int(parts[2]) if len(parts) > 2 else 0
+    if len(parts) < 4:  # первый шаг — подтверждение
+        await c.message.edit_reply_markup(reply_markup=kb([
+            [InlineKeyboardButton(text=f"✅ Да, удалить №{rid}", callback_data=f"rdel:{rid}:{page}:y")],
+            [InlineKeyboardButton(text="↩️ Отмена", callback_data=f"arev:{page}")],
+        ]))
+        await c.answer()
+        return
+    with db() as conn:
+        conn.execute("DELETE FROM reviews WHERE id = ?", (rid,))
+    text, markup = admin_reviews(page)
+    await c.message.edit_text(text, reply_markup=markup)
+    await c.answer(f"Отзыв №{rid} удалён")
 
 
 @router.callback_query(F.data.startswith("edit:"))
@@ -526,8 +870,9 @@ async def cb_confirm(c: CallbackQuery, bot: Bot):
     if not is_admin(c.from_user.id):
         await c.answer()
         return
-    action, order_id = c.data.split(":")
-    order_id = int(order_id)
+    parts = c.data.split(":")
+    action, order_id = parts[0], int(parts[1])
+    from_card = len(parts) > 2
     order = get_order(order_id)
     if not order:
         await c.answer("Заявка не найдена", show_alert=True)
@@ -539,7 +884,44 @@ async def cb_confirm(c: CallbackQuery, bot: Bot):
         await bot.send_message(order["user_id"], fmt(text_key, order_id=order_id))
     except Exception as e:
         logging.warning("Не удалось написать клиенту: %s", e)
-    await c.message.edit_text(c.message.text + f"\n\nСтатус: {STATUS_NAMES[status]}")
+    if from_card:
+        text, markup = order_card(order_id)
+        await c.message.edit_text(text, reply_markup=markup)
+    else:
+        markup = None
+        if status == "paid":
+            markup = kb([[InlineKeyboardButton(text="🏁 Заказ выполнен", callback_data=f"done:{order_id}")]])
+        await c.message.edit_text(c.message.text + f"\n\nСтатус: {STATUS_NAMES[status]}",
+                                  reply_markup=markup)
+    await c.answer("Готово")
+
+
+@router.callback_query(F.data.startswith("done:"))
+async def cb_done(c: CallbackQuery, bot: Bot):
+    if not is_admin(c.from_user.id):
+        await c.answer()
+        return
+    parts = c.data.split(":")
+    order_id = int(parts[1])
+    from_card = len(parts) > 2
+    order = get_order(order_id)
+    if not order:
+        await c.answer("Заявка не найдена", show_alert=True)
+        return
+    if order["status"] == "done":
+        await c.answer("Уже отмечен как выполненный", show_alert=True)
+        return
+    set_order_status(order_id, "done")
+    try:
+        await bot.send_message(order["user_id"], fmt("done_text", order_id=order_id))
+    except Exception as e:
+        logging.warning("Не удалось написать клиенту: %s", e)
+    if from_card:
+        text, markup = order_card(order_id)
+        await c.message.edit_text(text, reply_markup=markup)
+    else:
+        await c.message.edit_reply_markup(reply_markup=None)
+        await c.message.answer(f"🏁 Заказ №{order_id} отмечен выполненным, клиент уведомлён.")
     await c.answer("Готово")
 
 
