@@ -17,7 +17,10 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BotCommand,
     CallbackQuery,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -213,6 +216,29 @@ def main_menu():
     ])
 
 
+MENU_KEYS = ("btn_info", "btn_prices", "btn_buy", "btn_contact")
+
+
+def reply_menu():
+    """Постоянные кнопки меню внизу экрана (всегда видны)."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=get("btn_buy"))],
+            [KeyboardButton(text=get("btn_info")), KeyboardButton(text=get("btn_prices"))],
+            [KeyboardButton(text=get("btn_contact"))],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def menu_key(text):
+    for key in MENU_KEYS:
+        if text == get(key):
+            return key
+    return None
+
+
 def back_menu():
     return kb([[InlineKeyboardButton(text="⬅️ В меню", callback_data="menu")]])
 
@@ -262,13 +288,31 @@ router = Router()
 async def start(m: Message, state: FSMContext):
     await state.clear()
     save_user(m)
-    await m.answer(fmt("welcome"), reply_markup=main_menu())
+    await m.answer(fmt("welcome"), reply_markup=reply_menu())
 
 
 @router.message(Command("cancel"))
 async def cancel(m: Message, state: FSMContext):
     await state.clear()
-    await m.answer("Отменено.", reply_markup=main_menu())
+    await m.answer("Отменено.", reply_markup=reply_menu())
+
+
+async def ask_niche(m: Message, state: FSMContext):
+    await state.set_state(Buy.niche)
+    await m.answer(fmt("ask_niche") + "\n\n(для отмены — /cancel)")
+
+
+@router.message(lambda m: m.text is not None and menu_key(m.text) is not None)
+async def reply_menu_press(m: Message, state: FSMContext):
+    """Нажатие на постоянную кнопку меню внизу — работает в любой момент."""
+    await state.clear()
+    save_user(m)
+    key = menu_key(m.text)
+    if key == "btn_buy":
+        await ask_niche(m, state)
+    else:
+        page = {"btn_info": "info", "btn_prices": "prices", "btn_contact": "contact"}[key]
+        await m.answer(fmt(page), reply_markup=reply_menu())
 
 
 @router.callback_query(F.data == "menu")
@@ -286,8 +330,7 @@ async def cb_page(c: CallbackQuery):
 
 @router.callback_query(F.data == "buy")
 async def cb_buy(c: CallbackQuery, state: FSMContext):
-    await state.set_state(Buy.niche)
-    await c.message.answer(fmt("ask_niche") + "\n\n(для отмены — /cancel)")
+    await ask_niche(c.message, state)
     await c.answer()
 
 
@@ -473,6 +516,8 @@ async def edit_value(m: Message, state: FSMContext):
 
     set_value(key, value)
     await state.clear()
+    if key in MENU_KEYS:
+        await m.answer("Кнопки меню обновлены 👇", reply_markup=reply_menu())
     await m.answer(f"✅ Сохранено: «{label}»", reply_markup=settings_menu())
 
 
@@ -513,6 +558,7 @@ async def main():
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
+    await bot.set_my_commands([BotCommand(command="start", description="Главное меню")])
     await dp.start_polling(bot)
 
 
