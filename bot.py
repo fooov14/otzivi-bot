@@ -158,6 +158,15 @@ def init_db():
             "CREATE TABLE IF NOT EXISTS reviews (id INTEGER PRIMARY KEY AUTOINCREMENT, "
             "user_id INTEGER UNIQUE, username TEXT, name TEXT, stars INTEGER, text TEXT, created TEXT)"
         )
+        # Миграция: если bot.db остался от старой версии бота, в таблице orders
+        # может не хватать колонок — тогда create_order падает молча.
+        have = {row["name"] for row in c.execute("PRAGMA table_info(orders)")}
+        for col, typ in (("user_id", "INTEGER"), ("username", "TEXT"), ("niche", "TEXT"),
+                         ("city", "TEXT"), ("qty", "INTEGER"), ("total", "INTEGER"),
+                         ("status", "TEXT"), ("created", "TEXT")):
+            if col not in have:
+                c.execute(f"ALTER TABLE orders ADD COLUMN {col} {typ}")
+                logging.warning("В таблицу orders добавлена колонка %s", col)
         for key, (_, default, _) in SETTINGS.items():
             c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, default))
 
@@ -190,9 +199,12 @@ def fmt(key: str, **extra) -> str:
     values = _Safe(price=get_int("price"), min_qty=get_int("min_qty"), **extra)
     text = get(key)
     try:
-        return text.format_map(values)
-    except (ValueError, IndexError):
-        return text  # если в тексте сломаны фигурные скобки — показываем как есть
+        result = text.format_map(values)
+    except Exception:
+        result = text  # если в тексте сломаны фигурные скобки — показываем как есть
+    if not result.strip():  # пустой текст Telegram не отправит
+        result = SETTINGS[key][1].format_map(values) if key in SETTINGS else "—"
+    return result
 
 
 def save_user(m: Message):
@@ -533,8 +545,27 @@ async def buy_qty(m: Message, state: FSMContext):
     qty = int(text)
     data = await state.get_data()
     await state.clear()
+    try:
+        await send_payment(m, data, qty)
+    except Exception as e:
+        # Раньше любая ошибка здесь проглатывалась: клиент ничего не получал
+        # и видел только меню. Теперь пишем в лог, клиенту и админу.
+        logging.exception("Ошибка при оформлении заявки")
+        await m.answer("⚠️ Не удалось оформить заявку, попробуйте ещё раз или напишите нам.",
+                       reply_markup=reply_menu())
+        for admin_id in ADMIN_IDS:
+            try:
+                await m.bot.send_message(admin_id, f"⚠️ Ошибка при оформлении заявки:\n{type(e).__name__}: {e}")
+            except Exception:
+                pass
+
+
+async def send_payment(m: Message, data: dict, qty: int):
+    niche = data.get("niche", "—")
+    city = data.get("city", "—")
     total = qty * get_int("price")
-    order_id = create_order(m.from_user, data["niche"], data["city"], qty, total)
+    order_id = create_order(m.from_user, niche, city, qty, total)
+    data = {"niche": niche, "city": city}
 
     pay_url = get("pay_url")
     rows = []
