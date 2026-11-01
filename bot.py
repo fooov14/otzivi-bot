@@ -947,6 +947,7 @@ async def edit_value(m: Message, state: FSMContext):
 
     set_value(key, value)
     await state.clear()
+    asyncio.create_task(backup_now(m.bot))
     if key in MENU_KEYS:
         await m.answer("Кнопки меню обновлены 👇", reply_markup=reply_menu())
     await m.answer(f"✅ Сохранено: «{label}»", reply_markup=settings_menu())
@@ -1025,18 +1026,129 @@ async def fallback(m: Message):
 # ----------------------------------------------------------------------------
 
 
+# ----------------------------------------------------------------------------
+# Резервная копия базы в Telegram.
+# Хостинг может стирать bot.db при каждом обновлении. Поэтому бот сам отправляет
+# копию базы первому админу в чат и закрепляет её. Если после перезапуска база
+# оказалась пустой, бот скачивает закреплённую копию и восстанавливает всё:
+# тексты, кнопки, цену, заказы, отзывы.
+# ----------------------------------------------------------------------------
+
+BACKUP_ADMIN = min(ADMIN_IDS) if ADMIN_IDS else None
+BACKUP_CAPTION = "🗄 Резервная копия базы бота. Не удаляйте и не открепляйте это сообщение."
+_last_backup_sig = None
+_backup_lock = asyncio.Lock()
+
+
+def db_signature() -> str:
+    """Отпечаток содержимого базы, чтобы не слать копию, если ничего не менялось."""
+    with db() as c:
+        parts = []
+        for table in ("settings", "orders", "reviews", "users"):
+            rows = c.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+            parts.append(repr([tuple(r) for r in rows]))
+    return str(hash("|".join(parts)))
+
+
+def db_bytes() -> bytes:
+    tmp = DB_PATH + ".backup"
+    src, dst = sqlite3.connect(DB_PATH), sqlite3.connect(tmp)
+    with dst:
+        src.backup(dst)
+    src.close()
+    dst.close()
+    with open(tmp, "rb") as f:
+        data = f.read()
+    os.remove(tmp)
+    return data
+
+
+async def backup_now(bot: Bot, force: bool = False):
+    global _last_backup_sig
+    if BACKUP_ADMIN is None:
+        return
+    async with _backup_lock:
+        try:
+            sig = db_signature()
+            if sig == _last_backup_sig and not force:
+                return
+            from aiogram.types import BufferedInputFile
+            msg = await bot.send_document(
+                BACKUP_ADMIN,
+                BufferedInputFile(db_bytes(), filename="bot.db"),
+                caption=BACKUP_CAPTION,
+                disable_notification=True,
+            )
+            await bot.pin_chat_message(BACKUP_ADMIN, msg.message_id, disable_notification=True)
+            with db() as c:
+                row = c.execute("SELECT value FROM settings WHERE key = '_backup_msg_id'").fetchone()
+                c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('_backup_msg_id', ?)",
+                          (str(msg.message_id),))
+            if row and row["value"].isdigit():  # убираем предыдущую копию, чтобы не копились
+                try:
+                    await bot.delete_message(BACKUP_ADMIN, int(row["value"]))
+                except Exception:
+                    pass
+            _last_backup_sig = db_signature()
+        except Exception as e:
+            logging.warning("Не удалось сделать резервную копию: %s", e)
+
+
+async def restore_from_telegram(bot: Bot):
+    """Скачивает закреплённую копию базы из чата с админом."""
+    if BACKUP_ADMIN is None:
+        return None
+    try:
+        chat = await bot.get_chat(BACKUP_ADMIN)
+        pinned = chat.pinned_message
+        if not pinned or not pinned.document or pinned.document.file_name != "bot.db":
+            logging.info("Закреплённой резервной копии нет — начинаем с чистой базы")
+            return None
+        f = await bot.download(pinned.document.file_id)
+        data = f.read()
+        if not data.startswith(b"SQLite format 3"):
+            return None
+        with open(DB_PATH, "wb") as out:
+            out.write(data)
+        logging.info("База восстановлена из резервной копии в Telegram")
+        return pinned.message_id
+    except Exception as e:
+        logging.warning("Не удалось восстановить базу из Telegram: %s", e)
+        return None
+
+
+async def backup_loop(bot: Bot):
+    while True:
+        await asyncio.sleep(30)
+        await backup_now(bot)
+
+
 async def main():
+    global _last_backup_sig
     logging.basicConfig(level=logging.INFO)
     if not BOT_TOKEN or BOT_TOKEN.startswith("ВСТАВЬТЕ"):
         raise SystemExit("Укажите BOT_TOKEN в файле config.env")
     if not ADMIN_IDS:
         logging.warning("ADMIN_IDS не указан в config.env — админка никому не доступна")
-    init_db()
-    logging.info("База данных: %s", DB_PATH)
     bot = Bot(BOT_TOKEN)
+    restored = None
+    if not os.path.exists(DB_PATH):
+        restored = await restore_from_telegram(bot)
+    init_db()
+    if restored:
+        set_value("_backup_msg_id", str(restored))
+    logging.info("База данных: %s (восстановлена из Telegram: %s)", DB_PATH, bool(restored))
+    _last_backup_sig = db_signature() if restored else None
+    if restored and BACKUP_ADMIN:
+        try:
+            await bot.send_message(BACKUP_ADMIN, "♻️ Бот перезапущен, настройки и заказы восстановлены.",
+                                   disable_notification=True)
+        except Exception:
+            pass
     dp = Dispatcher(storage=SQLiteStorage())
     dp.include_router(router)
     await bot.set_my_commands([BotCommand(command="start", description="Главное меню")])
+    asyncio.create_task(backup_loop(bot))
     await dp.start_polling(bot)
 
 
