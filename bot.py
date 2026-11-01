@@ -38,7 +38,12 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {
     int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()
 }
-DB_PATH = os.path.join(BASE_DIR, "bot.db")
+# База должна лежать в постоянном хранилище, иначе хостинг стирает её при обновлении.
+# На Bothost это /app/data. Можно переопределить переменной окружения DB_PATH.
+DB_PATH = os.getenv("DB_PATH") or (
+    "/app/data/bot.db" if os.path.isdir("/app/data") else os.path.join(BASE_DIR, "bot.db")
+)
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 # Все настраиваемые параметры: ключ -> (название в админке, значение по умолчанию, тип)
 # Тип: text — любой текст, int — целое число, url — ссылка
@@ -1027,6 +1032,7 @@ async def main():
     if not ADMIN_IDS:
         logging.warning("ADMIN_IDS не указан в config.env — админка никому не доступна")
     init_db()
+    logging.info("База данных: %s", DB_PATH)
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher(storage=SQLiteStorage())
     dp.include_router(router)
