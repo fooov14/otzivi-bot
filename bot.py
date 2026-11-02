@@ -88,11 +88,16 @@ SETTINGS = {
     "pay_url": ("Ссылка на оплату", "https://example.com/pay", "url"),
     "ask_niche": ("Вопрос: ниша", "Напишите вашу нишу (например: барбершоп, ремонт квартир):", "text"),
     "ask_city": ("Вопрос: город", "В каком городе нужны клиенты?", "text"),
+    "ask_link": (
+        "Вопрос: ссылка",
+        "Пришлите ссылку, где нужны отзывы: ваша организация на Яндекс Картах или сайт.",
+        "text",
+    ),
     "ask_qty": ("Вопрос: количество", "Сколько клиентов нужно? Отправьте число (минимум {min_qty}).", "text"),
     "pay_text": (
         "Текст перед оплатой",
         "Ваша заявка №{order_id}\n\n"
-        "Ниша: {niche}\nГород: {city}\nКоличество: {qty} шт.\n"
+        "Ниша: {niche}\nГород: {city}\nСсылка: {link}\nКоличество: {qty} шт.\n"
         "Сумма к оплате: {total} ₽\n\n"
         "Нажмите «Оплатить», а после оплаты — «Я оплатил».",
         "text",
@@ -158,7 +163,7 @@ def init_db():
         c.execute(
             "CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY AUTOINCREMENT, "
             "user_id INTEGER, username TEXT, niche TEXT, city TEXT, qty INTEGER, "
-            "total INTEGER, status TEXT, created TEXT)"
+            "total INTEGER, status TEXT, created TEXT, link TEXT)"
         )
         c.execute(
             "CREATE TABLE IF NOT EXISTS reviews (id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -169,7 +174,7 @@ def init_db():
         have = {row["name"] for row in c.execute("PRAGMA table_info(orders)")}
         for col, typ in (("user_id", "INTEGER"), ("username", "TEXT"), ("niche", "TEXT"),
                          ("city", "TEXT"), ("qty", "INTEGER"), ("total", "INTEGER"),
-                         ("status", "TEXT"), ("created", "TEXT")):
+                         ("status", "TEXT"), ("created", "TEXT"), ("link", "TEXT")):
             if col not in have:
                 c.execute(f"ALTER TABLE orders ADD COLUMN {col} {typ}")
                 logging.warning("В таблицу orders добавлена колонка %s", col)
@@ -261,13 +266,13 @@ def save_user(m: Message):
         )
 
 
-def create_order(user, niche, city, qty, total) -> int:
+def create_order(user, niche, city, qty, total, link="") -> int:
     with db() as c:
         cur = c.execute(
-            "INSERT INTO orders (user_id, username, niche, city, qty, total, status, created) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'new', ?)",
+            "INSERT INTO orders (user_id, username, niche, city, qty, total, status, created, link) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'new', ?, ?)",
             (user.id, user.username or "", niche, city, qty, total,
-             datetime.now().strftime("%Y-%m-%d %H:%M")),
+             datetime.now().strftime("%Y-%m-%d %H:%M"), link),
         )
         return cur.lastrowid
 
@@ -357,6 +362,7 @@ def is_admin(user_id: int) -> bool:
 class Buy(StatesGroup):
     niche = State()
     city = State()
+    link = State()
     qty = State()
 
 
@@ -405,6 +411,7 @@ def my_orders_text(user_id: int) -> str:
         lines.append(
             f"Заказ №{o['id']} от {o['created']}\n"
             f"{o['niche']}, {o['city']} — {o['qty']} шт.\n"
+            f"Ссылка: {o['link'] or '—'}\n"
             f"Сумма: {o['total']} ₽\n"
             f"Статус: {CLIENT_STATUS.get(o['status'], o['status'])}"
         )
@@ -576,6 +583,19 @@ async def buy_niche(m: Message, state: FSMContext):
 @router.message(Buy.city, F.text)
 async def buy_city(m: Message, state: FSMContext):
     await state.update_data(city=m.text.strip()[:100])
+    await state.set_state(Buy.link)
+    await m.answer(fmt("ask_link"))
+
+
+@router.message(Buy.link, F.text)
+async def buy_link(m: Message, state: FSMContext):
+    link = m.text.strip()
+    # Ссылка или хотя бы адрес сайта (yandex.ru/maps/..., mysite.ru)
+    if " " in link or "." not in link or len(link) > 500:
+        await m.answer("Не похоже на ссылку. Пришлите ссылку на Яндекс Карты или адрес сайта, "
+                       "например: https://yandex.ru/maps/org/... или mysite.ru\n\nДля отмены — /cancel")
+        return
+    await state.update_data(link=link)
     await state.set_state(Buy.qty)
     await m.answer(fmt("ask_qty"))
 
@@ -608,8 +628,9 @@ async def buy_qty(m: Message, state: FSMContext):
 async def send_payment(m: Message, data: dict, qty: int):
     niche = data.get("niche", "—")
     city = data.get("city", "—")
+    link = data.get("link", "—")
     total = qty * get_int("price")
-    order_id = create_order(m.from_user, niche, city, qty, total)
+    order_id = create_order(m.from_user, niche, city, qty, total, link)
     data = {"niche": niche, "city": city}
 
     pay_url = get("pay_url")
@@ -619,7 +640,12 @@ async def send_payment(m: Message, data: dict, qty: int):
     rows.append([InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"paid:{order_id}")])
     rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="menu")])
     text = fmt("pay_text", order_id=order_id, niche=data["niche"], city=data["city"],
-               qty=qty, total=total)
+               qty=qty, total=total, link=link)
+    if "{link}" not in get("pay_text"):
+        # Старый текст заявки из админки без {link} — всё равно показываем ссылку клиенту
+        marker = f"Город: {city}\n"
+        text = text.replace(marker, marker + f"Ссылка: {link}\n", 1) if marker in text \
+            else text + f"\n\nСсылка: {link}"
     try:
         await m.answer(text, reply_markup=kb(rows))
     except Exception as e:
@@ -654,6 +680,7 @@ async def cb_paid(c: CallbackQuery, bot: Bot):
     text = (
         f"💸 Новая оплата на проверку — заявка №{order_id}\n\n"
         f"Клиент: {who}\nНиша: {order['niche']}\nГород: {order['city']}\n"
+        f"Ссылка: {order['link'] or '—'}\n"
         f"Количество: {order['qty']} шт.\nСумма: {order['total']} ₽"
     )
     buttons = kb([[
@@ -748,6 +775,7 @@ def order_card(order_id: int, back: str = "all:0"):
         f"Клиент: {who}\n"
         f"Ниша: {o['niche']}\n"
         f"Город: {o['city']}\n"
+        f"Ссылка: {o['link'] or '—'}\n"
         f"Количество: {o['qty']} шт.\n"
         f"Сумма: {o['total']} ₽\n\n"
         f"Статус: {STATUS_NAMES.get(o['status'], o['status'])}"
@@ -917,7 +945,7 @@ async def cb_edit(c: CallbackQuery, state: FSMContext):
     }[kind]
     if kind == "text" and key not in ("btn_info", "btn_prices", "btn_buy", "btn_contact"):
         hint += ("\n\nМожно вставлять: {price} — цена, {min_qty} — минимальный заказ."
-                 "\nВ текстах заявки также: {order_id}, {niche}, {city}, {qty}, {total}.")
+                 "\nВ текстах заявки также: {order_id}, {niche}, {city}, {link}, {qty}, {total}.")
     await state.set_state(Edit.value)
     await state.update_data(key=key)
     await c.message.answer(f"«{label}»\n\nСейчас:")
